@@ -214,8 +214,24 @@ def _next_run() -> str | None:
 
 # ── App lifespan ──────────────────────────────────────────────────────────────
 
+def _restore_session_from_env():
+    """Write tv_session.json from TV_SESSION_B64 env var if the file is missing."""
+    session_b64 = os.getenv("TV_SESSION_B64", "")
+    if not session_b64:
+        return
+    if os.path.exists(SESSION_FILE):
+        return
+    try:
+        data = base64.b64decode(session_b64).decode("utf-8")
+        with open(SESSION_FILE, "w") as f:
+            f.write(data)
+        log.info("tv_session.json restored from TV_SESSION_B64 env var")
+    except Exception as e:
+        log.warning(f"Failed to restore session from env: {e}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _restore_session_from_env()
     scheduler.start()
     try:
         cfg = await fetch_config_from_supabase()
