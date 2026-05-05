@@ -93,18 +93,22 @@ async def write_log(status: str, image_b64: str | None, reason: str | None):
     }
     try:
         async with httpx.AsyncClient() as client:
-            await client.post(
+            r = await client.post(
                 f"{SUPABASE_URL}/rest/v1/screenshot_log",
                 headers=_sb_headers(),
                 json=payload,
                 timeout=15,
             )
+            if r.status_code not in (200, 201, 204):
+                log.warning(f"write_log HTTP {r.status_code}: {r.text[:200]}")
+            else:
+                log.info(f"write_log OK ({r.status_code}) — status={status} reason={payload.get('reason','')!r}")
     except Exception as e:
         log.warning(f"Failed to write log: {e}")
 
 # ── Screenshot ────────────────────────────────────────────────────────────────
 
-def _take_screenshot_sync(pair: str | None) -> str:
+def _take_screenshot_sync(pair: str | None) -> bytes:
     symbol = SYMBOL_MAP.get((pair or "").upper())
     chart_url = (
         f"{BASE_CHART_URL}?symbol={urllib.parse.quote(symbol)}"
@@ -115,21 +119,20 @@ def _take_screenshot_sync(pair: str | None) -> str:
         browser = p.chromium.launch(headless=True)
         ctx = browser.new_context(
             storage_state=SESSION_FILE,
-            viewport={"width": 1600, "height": 900},
+            viewport={"width": 1280, "height": 720},
         )
         page = ctx.new_page()
         page.goto(chart_url)
         page.wait_for_selector(".chart-container", timeout=15000)
         page.wait_for_timeout(3000)
-        page.screenshot(path="chart.png")
+        img_bytes = page.screenshot(type="jpeg", quality=75)
         browser.close()
-    return "chart.png"
+    return img_bytes
 
 async def capture(pair: str | None) -> str:
     loop = asyncio.get_running_loop()
-    path = await loop.run_in_executor(None, _take_screenshot_sync, pair)
-    with open(path, "rb") as f:
-        return base64.b64encode(f.read()).decode()
+    img_bytes = await loop.run_in_executor(None, _take_screenshot_sync, pair)
+    return base64.b64encode(img_bytes).decode()
 
 # ── Session check ─────────────────────────────────────────────────────────────
 
