@@ -127,10 +127,6 @@ def _take_screenshot_sync(pair: str | None) -> bytes:
         page.wait_for_timeout(3000)
 
         # ── Zoom to today only ────────────────────────────────────────────────
-        # Press 'D' to jump to daily view, then use keyboard shortcut to
-        # reset zoom and fit today's session into the viewport.
-        # TradingView shortcut: Alt+R resets zoom, then we use the date range
-        # bar at the bottom to select "1D" (today only).
         try:
             # Click the "1D" range button at the bottom of the chart
             one_day_btn = page.locator('button[data-value="1D"]').first
@@ -138,12 +134,10 @@ def _take_screenshot_sync(pair: str | None) -> bytes:
                 one_day_btn.click()
                 page.wait_for_timeout(1500)
             else:
-                # Fallback: use keyboard shortcut Alt+R to reset zoom then
-                # press Left arrow to shift view to show only today
+                # Fallback: Alt+R resets zoom to fit current view
                 page.keyboard.press("Alt+r")
                 page.wait_for_timeout(1000)
         except Exception:
-            # If neither works, just take the screenshot as-is
             pass
 
         page.wait_for_timeout(1500)
@@ -151,6 +145,10 @@ def _take_screenshot_sync(pair: str | None) -> bytes:
         browser.close()
     return img_bytes
 
+async def capture(pair: str | None) -> str:
+    loop = asyncio.get_running_loop()
+    img_bytes = await loop.run_in_executor(None, _take_screenshot_sync, pair)
+    return base64.b64encode(img_bytes).decode()
 
 # ── Session check ─────────────────────────────────────────────────────────────
 
