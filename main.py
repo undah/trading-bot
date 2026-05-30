@@ -22,8 +22,36 @@ log = logging.getLogger(__name__)
 
 SUPABASE_URL   = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY   = os.getenv("SUPABASE_SERVICE_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 BASE_CHART_URL = os.getenv("BASE_CHART_URL", "https://www.tradingview.com/chart/GoEcqSyG/")
 SESSION_FILE   = "tv_session.json"
+
+FINETUNED_MODEL = "ft:gpt-4o-2024-08-06:korda::DczJwNyv"
+
+VALIDATION_SYSTEM_PROMPT = """You are Korda, a trading setup classifier trained on the TPSS (Trade Setup Scoring System) framework. You receive a chart screenshot and evaluate the price action strictly between the WHITE LINE (start of window) and the YELLOW LINE (entry cutoff). Everything before the white line does not exist.
+Apply this three-step checklist in order. Stop at the first failure.
+STEP 1 — STATE CLARITY
+Does this chart tell a clear, obvious story between the lines?
+- Hard to determine trend = BAD
+- Multiple direction changes, no dominant direction = BAD
+- Ambiguous bias at the yellow line = BAD (even if steps 2 and 3 pass)
+STEP 2 — CONVINCING DIRECTIONAL MOVE
+Must occur between the white line and ~1hr before the yellow line.
+- Ranging or chopping first is fine — a convincing move anywhere in the window passes
+- Must show conviction: strong impulse candles, decisive structure break, clear follow-through
+- A consistent grind where one direction dominates is equally valid
+- Liquidity grab = NOT valid (barely takes a level then immediately reverses)
+- Conviction break = valid (closes well beyond the level, momentum continues)
+- Direction does not matter — long and short are equally valid
+STEP 3 — VALID PAUSE BEFORE YELLOW LINE
+- Any visible slowdown, consolidation, or pullback after the move counts
+- NON-NEGOTIABLE — clean trend straight into yellow line with no pause = BAD
+- Pullback must NOT break the structural low (longs) or structural high (shorts) that originated the move
+- Structural low/high = origin point of the move, NOT intermediate lows formed during it
+- Pullback respecting the structural level = confirmation, increases confidence
+
+Respond ONLY with a JSON object, no markdown, no extra text:
+{"result": "valid" or "invalid", "reasoning": "one or two sentences max"}"""
 
 SYMBOL_MAP = {
     "EURUSD": "FX:EURUSD",  "GBPUSD": "FX:GBPUSD",   "USDJPY": "FX:USDJPY",
@@ -64,7 +92,7 @@ def _sb_headers() -> dict:
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
-        "Prefer": "return=minimal",
+        "Prefer": "return=representation",
     }
 
 async def fetch_config_from_supabase() -> dict | None:
@@ -82,9 +110,10 @@ async def fetch_config_from_supabase() -> dict | None:
             return rows[0] if rows else None
     return None
 
-async def write_log(status: str, image_b64: str | None, reason: str | None):
+async def write_log(status: str, image_b64: str | None, reason: str | None) -> str | None:
+    """Write a log entry and return the new row's id."""
     if not SUPABASE_URL or not SUPABASE_KEY:
-        return
+        return None
     payload = {
         "status": status,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -99,12 +128,95 @@ async def write_log(status: str, image_b64: str | None, reason: str | None):
                 json=payload,
                 timeout=15,
             )
-            if r.status_code not in (200, 201, 204):
-                log.warning(f"write_log HTTP {r.status_code}: {r.text[:200]}")
+            if r.status_code in (200, 201):
+                rows = r.json()
+                row_id = rows[0].get("id") if rows else None
+                log.info(f"write_log OK — id={row_id} status={status}")
+                return row_id
             else:
-                log.info(f"write_log OK ({r.status_code}) — status={status} reason={payload.get('reason','')!r}")
+                log.warning(f"write_log HTTP {r.status_code}: {r.text[:200]}")
+                return None
     except Exception as e:
         log.warning(f"Failed to write log: {e}")
+        return None
+
+async def update_validation(row_id: str, result: str, reasoning: str):
+    """Patch ai_validation and ai_reasoning onto an existing log row."""
+    if not SUPABASE_URL or not SUPABASE_KEY or not row_id:
+        return
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.patch(
+                f"{SUPABASE_URL}/rest/v1/screenshot_log",
+                headers={**_sb_headers(), "Prefer": "return=minimal"},
+                params={"id": f"eq.{row_id}"},
+                json={"ai_validation": result, "ai_reasoning": reasoning},
+                timeout=10,
+            )
+            if r.status_code in (200, 201, 204):
+                log.info(f"update_validation OK — id={row_id} result={result}")
+            else:
+                log.warning(f"update_validation HTTP {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        log.warning(f"Failed to update validation: {e}")
+
+# ── AI Validation ─────────────────────────────────────────────────────────────
+
+async def validate_screenshot(img_b64: str) -> tuple[str, str]:
+    """Send screenshot to finetuned model, return (result, reasoning)."""
+    if not OPENAI_API_KEY:
+        log.warning("OPENAI_API_KEY not set — skipping validation")
+        return "error", "OPENAI_API_KEY not configured"
+
+    payload = {
+        "model": FINETUNED_MODEL,
+        "max_tokens": 200,
+        "messages": [
+            {"role": "system", "content": VALIDATION_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{img_b64}",
+                            "detail": "high",
+                        },
+                    },
+                    {"type": "text", "text": "Classify this chart setup."},
+                ],
+            },
+        ],
+    }
+
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=30,
+            )
+            if r.status_code != 200:
+                log.warning(f"OpenAI HTTP {r.status_code}: {r.text[:300]}")
+                return "error", f"OpenAI error {r.status_code}"
+
+            content = r.json()["choices"][0]["message"]["content"].strip()
+            # Strip markdown fences if model wraps response
+            content = content.replace("```json", "").replace("```", "").strip()
+            import json
+            parsed = json.loads(content)
+            result = parsed.get("result", "error")
+            reasoning = parsed.get("reasoning", "")
+            log.info(f"validate_screenshot → {result}: {reasoning}")
+            return result, reasoning
+
+    except Exception as e:
+        log.warning(f"validate_screenshot failed: {e}")
+        return "error", str(e)[:200]
 
 # ── Screenshot ────────────────────────────────────────────────────────────────
 
@@ -126,15 +238,12 @@ def _take_screenshot_sync(pair: str | None) -> bytes:
         page.wait_for_selector(".chart-container", timeout=15000)
         page.wait_for_timeout(3000)
 
-        # ── Zoom to today only ────────────────────────────────────────────────
         try:
-            # Click the "1D" range button at the bottom of the chart
             one_day_btn = page.locator('button[data-value="1D"]').first
             if one_day_btn.is_visible(timeout=3000):
                 one_day_btn.click()
                 page.wait_for_timeout(1500)
             else:
-                # Fallback: Alt+R resets zoom to fit current view
                 page.keyboard.press("Alt+r")
                 page.wait_for_timeout(1000)
         except Exception:
@@ -163,6 +272,25 @@ def _in_session(sessions: list) -> bool:
                 return True
     return False
 
+# ── Capture + validate (shared helper) ───────────────────────────────────────
+
+async def capture_and_validate(pair: str | None, trigger_reason: str) -> dict:
+    """Take a screenshot, log it, validate it, update the log row. Returns result dict."""
+    img_b64 = await capture(pair)
+    row_id = await write_log("success", img_b64, f"{trigger_reason} — {pair or 'default'}")
+
+    result, reasoning = await validate_screenshot(img_b64)
+    await update_validation(row_id, result, reasoning)
+
+    return {
+        "status": "success",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "image_base64": img_b64,
+        "pair": pair,
+        "ai_validation": result,
+        "ai_reasoning": reasoning,
+    }
+
 # ── Scheduled job ─────────────────────────────────────────────────────────────
 
 async def run_scheduled():
@@ -185,9 +313,8 @@ async def run_scheduled():
 
     for pair in pairs:
         try:
-            img_b64 = await capture(pair)
-            await write_log("success", img_b64, f"Scheduled — {pair}")
-            log.info(f"  ✓ {pair}")
+            result = await capture_and_validate(pair, "Scheduled")
+            log.info(f"  ✓ {pair} → {result['ai_validation']}")
         except Exception as e:
             log.error(f"  ✗ {pair}: {e}")
             await write_log("error", None, f"Scheduled — {pair}: {str(e)[:200]}")
@@ -231,7 +358,6 @@ def _next_run() -> str | None:
 # ── App lifespan ──────────────────────────────────────────────────────────────
 
 def _restore_session_from_env():
-    """Write tv_session.json from TV_SESSION_B64 env var if the file is missing."""
     session_b64 = os.getenv("TV_SESSION_B64", "")
     if not session_b64:
         return
@@ -268,7 +394,7 @@ app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PATCH"],
     allow_headers=["*"],
 )
 
@@ -309,14 +435,8 @@ async def run_single(body: RunRequest = RunRequest()):
     if not os.path.exists(SESSION_FILE):
         raise HTTPException(status_code=400, detail="tv_session.json not found.")
     try:
-        img_b64 = await capture(body.pair)
-        await write_log("success", img_b64, f"Manual — {body.pair or 'default'}")
-        return JSONResponse({
-            "status": "success",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "image_base64": img_b64,
-            "pair": body.pair,
-        })
+        result = await capture_and_validate(body.pair, "Manual")
+        return JSONResponse(result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -328,9 +448,8 @@ async def run_all():
     results = []
     for pair in pairs:
         try:
-            img_b64 = await capture(pair)
-            await write_log("success", img_b64, f"Manual — {pair}")
-            results.append({"pair": pair, "status": "success"})
+            result = await capture_and_validate(pair, "Manual")
+            results.append({"pair": pair, "status": "success", "ai_validation": result["ai_validation"]})
         except Exception as e:
             await write_log("error", None, f"Manual — {pair}: {str(e)[:200]}")
             results.append({"pair": pair, "status": "error", "detail": str(e)})
